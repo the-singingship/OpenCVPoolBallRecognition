@@ -9,7 +9,7 @@ const int HUE_LOW = 40, HUE_HIGH = 90;   // green cloth, in OpenCV hue units (0-
 const int SAT_LOW = 50, VAL_LOW = 60;    // paler or darker than this is not cloth (dark green balls, shadows)
 const int MIN_BLOB_AREA = 800;           // smaller blobs are noise
 const float POCKET_RADIUS = 75;          // ignore blobs this close to a pocket
-const int MAX_BLOB_AREA = 3750;          // bigger blobs are several balls touching (fixed in version 5)
+const int BALL_AREA = 2500;              // typical area of one ball in the warped image
 const char* GT_FILE = "Media/Pool/Ball_Locations_In_Transformed_Image.csv";
 const float MATCH_DIST = 30;             // a detection this close to a true ball counts as correct
 
@@ -48,7 +48,7 @@ bool nearPocket(Point2f p)
     return false;
 }
 
-// One centre (column, row) for every blob that is the right size to be a ball
+// One centre (column, row) per ball. A blob that is too big for one ball is split with k-means
 vector<Point2f> detectBalls(const Mat& mask)
 {
     vector<vector<Point>> contours;
@@ -58,12 +58,41 @@ vector<Point2f> detectBalls(const Mat& mask)
     for (size_t i = 0; i < contours.size(); i++)
     {
         double area = contourArea(contours[i]);
-        if (area < MIN_BLOB_AREA || area > MAX_BLOB_AREA) continue;
+        if (area < MIN_BLOB_AREA) continue;
 
-        Moments m = moments(contours[i]);
-        Point2f centre((float)(m.m10 / m.m00), (float)(m.m01 / m.m00));
-        if (nearPocket(centre)) continue;
-        centres.push_back(centre);
+        int count = (int)floor(area / BALL_AREA + 0.5);   // how many balls fit in this blob
+        if (count < 1) count = 1;
+
+        if (count == 1)
+        {
+            Moments m = moments(contours[i]);
+            Point2f centre((float)(m.m10 / m.m00), (float)(m.m01 / m.m00));
+            if (!nearPocket(centre)) centres.push_back(centre);
+        }
+        else
+        {
+            // touching balls: cluster the blob's pixels into 'count' groups, one per ball
+            Mat blob = Mat::zeros(mask.size(), CV_8UC1);
+            drawContours(blob, contours, (int)i, Scalar(255), FILLED);
+            vector<Point> pixels;
+            findNonZero(blob, pixels);
+
+            Mat data((int)pixels.size(), 2, CV_32F);
+            for (size_t p = 0; p < pixels.size(); p++)
+            {
+                data.at<float>((int)p, 0) = (float)pixels[p].x;
+                data.at<float>((int)p, 1) = (float)pixels[p].y;
+            }
+            Mat labels, cluster_centres;
+            kmeans(data, count, labels, TermCriteria(TermCriteria::EPS + TermCriteria::MAX_ITER, 20, 1.0),
+                3, KMEANS_PP_CENTERS, cluster_centres);
+
+            for (int k = 0; k < count; k++)
+            {
+                Point2f centre(cluster_centres.at<float>(k, 0), cluster_centres.at<float>(k, 1));
+                if (!nearPocket(centre)) centres.push_back(centre);
+            }
+        }
     }
     return centres;
 }
