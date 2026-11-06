@@ -1,15 +1,17 @@
-﻿
-// Library for loadinng the images and warp each table to a top-down view
-#include "Utilities.h"
+﻿#include "Utilities.h"
+#include <fstream>
+#include <sstream>
 
-// parameters remain the same for every image
+// Parameters are same for all images
 const int TABLE_W = 1434;    // table width in mm, columns of image
-const int TABLE_H = 683;     // table height in mm,  rows of image
+const int TABLE_H = 683;     // table height in mm, rows of image
 const int HUE_LOW = 40, HUE_HIGH = 90;   // green cloth, in OpenCV hue units (0-180)
 const int SAT_LOW = 50, VAL_LOW = 60;    // paler or darker than this is not cloth (dark green balls, shadows)
 const int MIN_BLOB_AREA = 800;           // smaller blobs are noise
 const float POCKET_RADIUS = 75;          // ignore blobs this close to a pocket
 const int MAX_BLOB_AREA = 3750;          // bigger blobs are several balls touching (fixed in version 5)
+const char* GT_FILE = "Media/Pool/Ball_Locations_In_Transformed_Image.csv";
+const float MATCH_DIST = 30;             // a detection this close to a true ball counts as correct
 
 // Warp the photo into a top-down view of the table (1 pixel = 1 mm)
 Mat warpTable(const Mat& image)
@@ -66,6 +68,65 @@ vector<Point2f> detectBalls(const Mat& mask)
     return centres;
 }
 
+// Ground truth for one image. Index 0-14 = balls 1-15, index 15 = white ball
+struct GroundTruth
+{
+    Point2f position[16];   // (column, row) in the warped table image
+    bool present[16];       // false if the ball is not on the table
+};
+
+// Reads one image's line from the CSV: name, then (row, column) for ball 1..15 and white
+bool loadGroundTruth(const string& image_name, GroundTruth& gt)
+{
+    ifstream file(GT_FILE);
+    if (!file.is_open()) { cout << "Could not open " << GT_FILE << endl; return false; }
+
+    string line;
+    while (getline(file, line))
+    {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        vector<string> cells;
+        stringstream ss(line);
+        string cell;
+        while (getline(ss, cell, ',')) cells.push_back(cell);
+        if (cells.empty() || cells[0] != image_name) continue;
+
+        for (int b = 0; b < 16; b++)
+        {
+            size_t row_cell = 1 + 2 * b, col_cell = 2 + 2 * b;
+            gt.present[b] = false;
+            if (col_cell < cells.size() && !cells[row_cell].empty() && !cells[col_cell].empty())
+            {
+                gt.position[b] = Point2f(stof(cells[col_cell]), stof(cells[row_cell]));
+                gt.present[b] = true;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+// For each true ball find the closest unused detection within MATCH_DIST.
+// match[b] = index of the detection for ball b, or -1 if the ball was missed
+vector<int> matchBalls(const vector<Point2f>& detections, const GroundTruth& gt)
+{
+    vector<int> match(16, -1);
+    vector<bool> used(detections.size(), false);
+    for (int b = 0; b < 16; b++)
+    {
+        if (!gt.present[b]) continue;
+        int best = -1;
+        float best_dist = MATCH_DIST;
+        for (size_t i = 0; i < detections.size(); i++)
+        {
+            float d = (float)norm(detections[i] - gt.position[b]);
+            if (!used[i] && d < best_dist) { best_dist = d; best = (int)i; }
+        }
+        if (best >= 0) { used[best] = true; match[b] = best; }
+    }
+    return match;
+}
+
 void MyApplication()
 {
     char* file_location = "Media/Pool/";
@@ -100,6 +161,9 @@ void MyApplication()
     }
     destroyAllWindows();
 
+    int total_tp = 0, total_fp = 0, total_fn = 0;
+    double total_error = 0;
+
     for (int file_no = 1; file_no < number_of_images; file_no++)
     {
         if (pool_image[file_no].empty()) continue;
@@ -107,16 +171,41 @@ void MyApplication()
         Mat table = warpTable(pool_image[file_no]);
         Mat mask = findBallMask(table);
         vector<Point2f> balls = detectBalls(mask);
-        cout << pool_files[file_no] << ": found " << balls.size() << " balls" << endl;
 
+        GroundTruth gt;
+        if (!loadGroundTruth(pool_files[file_no], gt)) { cout << "No ground truth for " << pool_files[file_no] << endl; continue; }
+        vector<int> match = matchBalls(balls, gt);
+
+        // Stage 1 counts: true positives, false positives, false negatives
+        int present = 0, tp = 0;
+        double error = 0;
+        for (int b = 0; b < 16; b++)
+        {
+            if (!gt.present[b]) continue;
+            present++;
+            if (match[b] >= 0) { tp++; error += norm(balls[match[b]] - gt.position[b]); }
+        }
+        int fp = (int)balls.size() - tp, fn = present - tp;
+        total_tp += tp; total_fp += fp; total_fn += fn; total_error += error;
+
+        cout << pool_files[file_no] << ": found " << balls.size() << ", truth " << present
+            << ", TP=" << tp << " FP=" << fp << " FN=" << fn
+            << ", mean error " << (tp > 0 ? error / tp : 0.0) << " mm" << endl;
+
+        // green circles = detections, red dots = ground truth
         Mat display = table.clone();
-        for (size_t i = 0; i < balls.size(); i++)
-            circle(display, balls[i], 25, Scalar(0, 255, 0), 2);
+        for (size_t i = 0; i < balls.size(); i++) circle(display, balls[i], 25, Scalar(0, 255, 0), 2);
+        for (int b = 0; b < 16; b++) if (gt.present[b]) circle(display, gt.position[b], 5, Scalar(0, 0, 255), FILLED);
         imshow(string(pool_files[file_no]) + " result", display);
-        imshow(string(pool_files[file_no]) + " mask", mask);
         cv::waitKey();
         destroyAllWindows();
     }
+
+    double precision = total_tp / (double)(total_tp + total_fp);
+    double recall = total_tp / (double)(total_tp + total_fn);
+    double f1 = 2 * precision * recall / (precision + recall);
+    cout << "STAGE 1 overall: precision=" << precision << " recall=" << recall << " F1=" << f1
+        << " mean error=" << (total_tp > 0 ? total_error / total_tp : 0.0) << " mm" << endl;
 
     delete[] pool_image;
 }
