@@ -11,7 +11,10 @@ const int MIN_BLOB_AREA = 800;           // smaller blobs are noise
 const float POCKET_RADIUS = 75;          // ignore blobs this close to a pocket
 const int BALL_AREA = 2500;              // typical area of one ball in the warped image
 const char* GT_FILE = "Media/Pool/Ball_Locations_In_Transformed_Image.csv";
-const float MATCH_DIST = 30;             // a detection this close to a true ball counts as correct
+const float MATCH_DIST = 22;             // a detection within a ball radius (43 mm / 2) of a true ball counts as correct
+const int PATCH_RADIUS = 18;             // we look at this many pixels around each ball centre
+const int HUE_BINS = 12;                 // hue histogram size
+const int FEATURE_SIZE = HUE_BINS + 4;   // white, dark, hue bins, mean saturation, mean value
 
 // Warp the photo into a top-down view of the table (1 pixel = 1 mm)
 Mat warpTable(const Mat& image)
@@ -156,6 +159,93 @@ vector<int> matchBalls(const vector<Point2f>& detections, const GroundTruth& gt)
     return match;
 }
 
+string labelName(int b)
+{
+    if (b < 0) return "?";
+    if (b == 15) return "W";
+    return to_string(b + 1);
+}
+
+// Describes the patch around a ball centre: how white, how dark, which hues, how saturated and bright
+vector<float> ballFeatures(const Mat& hsv_image, Point2f centre)
+{
+    vector<float> f(FEATURE_SIZE, 0.0f);
+    int pixel_count = 0, white = 0, dark = 0, coloured = 0;
+    float sum_s = 0, sum_v = 0;
+
+    for (int dy = -PATCH_RADIUS; dy <= PATCH_RADIUS; dy++)
+    {
+        for (int dx = -PATCH_RADIUS; dx <= PATCH_RADIUS; dx++)
+        {
+            if (dx * dx + dy * dy > PATCH_RADIUS * PATCH_RADIUS) continue;   // keep it circular
+            int x = (int)centre.x + dx, y = (int)centre.y + dy;
+            if (x < 0 || y < 0 || x >= hsv_image.cols || y >= hsv_image.rows) continue;
+
+            Vec3b p = hsv_image.at<Vec3b>(y, x);
+            int h = p[0], s = p[1], v = p[2];
+            pixel_count++;
+            if (v < 70) dark++;                       // black ball, shadows
+            else if (s < 60 && v > 150) white++;      // white ball, stripes, number circles
+            else
+            {
+                coloured++;
+                sum_s += s;
+                sum_v += v;
+                int bin = h * HUE_BINS / 180;
+                if (bin >= HUE_BINS) bin = HUE_BINS - 1;
+                f[2 + bin] += 1;
+            }
+        }
+    }
+    if (pixel_count == 0) return f;
+
+    f[0] = white / (float)pixel_count;
+    f[1] = dark / (float)pixel_count;
+    for (int b = 0; b < HUE_BINS; b++) f[2 + b] /= pixel_count;
+    if (coloured > 0)
+    {
+        f[2 + HUE_BINS] = sum_s / coloured / 255.0f;
+        f[3 + HUE_BINS] = sum_v / coloured / 255.0f;
+    }
+    return f;
+}
+
+float featureDistance(const vector<float>& a, const vector<float>& b)
+{
+    float sum = 0;
+    for (size_t i = 0; i < a.size(); i++) sum += (a[i] - b[i]) * (a[i] - b[i]);
+    return sqrt(sum);
+}
+
+// Training: AllBalls.jpeg and its ground truth give one reference description per ball
+vector<vector<float>> trainReferences(const Mat& all_balls_image, const string& name)
+{
+    vector<vector<float>> reference(16);
+    GroundTruth gt;
+    if (all_balls_image.empty() || !loadGroundTruth(name, gt)) return reference;
+
+    Mat table = warpTable(all_balls_image);
+    Mat hsv;
+    cvtColor(table, hsv, COLOR_BGR2HSV);
+    for (int b = 0; b < 16; b++)
+        if (gt.present[b]) reference[b] = ballFeatures(hsv, gt.position[b]);
+    return reference;
+}
+
+// Plain nearest neighbour: the closest reference wins
+int classifyBall(const vector<float>& features, const vector<vector<float>>& reference)
+{
+    int best = -1;
+    float best_dist = 1e9f;
+    for (int b = 0; b < 16; b++)
+    {
+        if (reference[b].empty()) continue;
+        float d = featureDistance(features, reference[b]);
+        if (d < best_dist) { best_dist = d; best = b; }
+    }
+    return best;
+}
+
 void MyApplication()
 {
     char* file_location = "Media/Pool/";
@@ -190,6 +280,9 @@ void MyApplication()
     }
     destroyAllWindows();
 
+    // Stage 2 training: one reference description per ball from AllBalls.jpeg
+    vector<vector<float>> reference = trainReferences(pool_image[0], pool_files[0]);
+
     int total_tp = 0, total_fp = 0, total_fn = 0;
     double total_error = 0;
 
@@ -197,6 +290,7 @@ void MyApplication()
     {
         if (pool_image[file_no].empty()) continue;
 
+        // ---- stage 1: find the balls ----
         Mat table = warpTable(pool_image[file_no]);
         Mat mask = findBallMask(table);
         vector<Point2f> balls = detectBalls(mask);
@@ -205,7 +299,6 @@ void MyApplication()
         if (!loadGroundTruth(pool_files[file_no], gt)) { cout << "No ground truth for " << pool_files[file_no] << endl; continue; }
         vector<int> match = matchBalls(balls, gt);
 
-        // Stage 1 counts: true positives, false positives, false negatives
         int present = 0, tp = 0;
         double error = 0;
         for (int b = 0; b < 16; b++)
@@ -216,15 +309,30 @@ void MyApplication()
         }
         int fp = (int)balls.size() - tp, fn = present - tp;
         total_tp += tp; total_fp += fp; total_fn += fn; total_error += error;
-
         cout << pool_files[file_no] << ": found " << balls.size() << ", truth " << present
-            << ", TP=" << tp << " FP=" << fp << " FN=" << fn
-            << ", mean error " << (tp > 0 ? error / tp : 0.0) << " mm" << endl;
+            << ", TP=" << tp << " FP=" << fp << " FN=" << fn << endl;
 
-        // green circles = detections, red dots = ground truth
+        // ---- stage 2: say which ball each detection is ----
+        Mat hsv;
+        cvtColor(table, hsv, COLOR_BGR2HSV);
+        vector<int> predicted(balls.size());
+        for (size_t i = 0; i < balls.size(); i++)
+            predicted[i] = classifyBall(ballFeatures(hsv, balls[i]), reference);
+
+        // what the classifier said for balls that were found correctly
+        for (int b = 0; b < 16; b++)
+            if (match[b] >= 0)
+                cout << "   true " << labelName(b) << " -> predicted " << labelName(predicted[match[b]])
+                << (predicted[match[b]] == b ? "" : "   WRONG") << endl;
+
         Mat display = table.clone();
-        for (size_t i = 0; i < balls.size(); i++) circle(display, balls[i], 25, Scalar(0, 255, 0), 2);
-        for (int b = 0; b < 16; b++) if (gt.present[b]) circle(display, gt.position[b], 5, Scalar(0, 0, 255), FILLED);
+        for (size_t i = 0; i < balls.size(); i++)
+        {
+            circle(display, balls[i], 25, Scalar(0, 255, 0), 2);
+            Point text_position((int)balls[i].x - 12, (int)balls[i].y + 8);
+            putText(display, labelName(predicted[i]), text_position, FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 0, 0), 4);
+            putText(display, labelName(predicted[i]), text_position, FONT_HERSHEY_SIMPLEX, 0.8, Scalar(255, 255, 255), 2);
+        }
         imshow(string(pool_files[file_no]) + " result", display);
         cv::waitKey();
         destroyAllWindows();
