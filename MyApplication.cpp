@@ -1,6 +1,8 @@
-﻿#include "Utilities.h"
+﻿// Version 7 (complete): version 6 + each ball used once + stage 2 evaluation (accuracy, confusion matrix)
+#include "Utilities.h"
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
 // Parameters are same for all images
 const int TABLE_W = 1434;    // table width in mm, columns of image
@@ -246,6 +248,72 @@ int classifyBall(const vector<float>& features, const vector<vector<float>>& ref
     return best;
 }
 
+// Nearest neighbour with one extra rule: each numbered ball exists once on the table
+struct Candidate { float dist; int ball; int label; };
+bool byDistance(const Candidate& a, const Candidate& b) { return a.dist < b.dist; }
+
+vector<int> assignLabels(const vector<vector<float>>& features, const vector<vector<float>>& reference)
+{
+    vector<Candidate> all;
+    for (size_t i = 0; i < features.size(); i++)
+        for (int l = 0; l < 16; l++)
+            if (!reference[l].empty())
+            {
+                Candidate c = { featureDistance(features[i], reference[l]), (int)i, l };
+                all.push_back(c);
+            }
+    sort(all.begin(), all.end(), byDistance);
+
+    vector<int> label(features.size(), -1);
+    vector<bool> label_used(16, false);
+    for (size_t k = 0; k < all.size(); k++)
+    {
+        if (label[all[k].ball] < 0 && !label_used[all[k].label])
+        {
+            label[all[k].ball] = all[k].label;
+            label_used[all[k].label] = true;
+        }
+    }
+    return label;
+}
+
+// Confusion matrix: row = true ball, column = predicted ball (last column = no label given)
+void addToConfusion(const vector<int>& match, const vector<int>& predicted, Mat& confusion)
+{
+    for (int b = 0; b < 16; b++)
+    {
+        if (match[b] < 0) continue;                   // ball was not even found
+        int p = predicted[match[b]];
+        if (p < 0) p = 16;
+        confusion.at<int>(b, p)++;
+    }
+}
+
+double confusionAccuracy(const Mat& confusion)
+{
+    int correct = 0, total = 0;
+    for (int r = 0; r < 16; r++)
+        for (int c = 0; c < 17; c++)
+        {
+            total += confusion.at<int>(r, c);
+            if (r == c) correct += confusion.at<int>(r, c);
+        }
+    return total > 0 ? correct / (double)total : 0.0;
+}
+
+void printConfusion(const Mat& confusion)
+{
+    cout << "      ";
+    for (int c = 0; c < 17; c++) cout << (c == 16 ? "none" : labelName(c)) << "\t";
+    cout << endl;
+    for (int r = 0; r < 16; r++)
+    {
+        cout << "true " << labelName(r) << "\t";
+        for (int c = 0; c < 17; c++) cout << confusion.at<int>(r, c) << "\t";
+        cout << endl;
+    }
+}
+
 void MyApplication()
 {
     char* file_location = "Media/Pool/";
@@ -285,6 +353,8 @@ void MyApplication()
 
     int total_tp = 0, total_fp = 0, total_fn = 0;
     double total_error = 0;
+    Mat confusion_nn = Mat::zeros(16, 17, CV_32S);       // plain nearest neighbour
+    Mat confusion_unique = Mat::zeros(16, 17, CV_32S);   // nearest neighbour, each ball used once
 
     for (int file_no = 1; file_no < number_of_images; file_no++)
     {
@@ -315,15 +385,17 @@ void MyApplication()
         // ---- stage 2: say which ball each detection is ----
         Mat hsv;
         cvtColor(table, hsv, COLOR_BGR2HSV);
-        vector<int> predicted(balls.size());
+        vector<vector<float>> features(balls.size());
+        vector<int> predicted_nn(balls.size());
         for (size_t i = 0; i < balls.size(); i++)
-            predicted[i] = classifyBall(ballFeatures(hsv, balls[i]), reference);
+        {
+            features[i] = ballFeatures(hsv, balls[i]);
+            predicted_nn[i] = classifyBall(features[i], reference);
+        }
+        vector<int> predicted = assignLabels(features, reference);
 
-        // what the classifier said for balls that were found correctly
-        for (int b = 0; b < 16; b++)
-            if (match[b] >= 0)
-                cout << "   true " << labelName(b) << " -> predicted " << labelName(predicted[match[b]])
-                << (predicted[match[b]] == b ? "" : "   WRONG") << endl;
+        addToConfusion(match, predicted_nn, confusion_nn);
+        addToConfusion(match, predicted, confusion_unique);
 
         Mat display = table.clone();
         for (size_t i = 0; i < balls.size(); i++)
@@ -333,16 +405,23 @@ void MyApplication()
             putText(display, labelName(predicted[i]), text_position, FONT_HERSHEY_SIMPLEX, 0.8, Scalar(0, 0, 0), 4);
             putText(display, labelName(predicted[i]), text_position, FONT_HERSHEY_SIMPLEX, 0.8, Scalar(255, 255, 255), 2);
         }
+        for (int b = 0; b < 16; b++)
+            if (gt.present[b]) circle(display, gt.position[b], 4, Scalar(0, 0, 255), FILLED);
         imshow(string(pool_files[file_no]) + " result", display);
         cv::waitKey();
         destroyAllWindows();
     }
 
+    // ---- final numbers for the report ----
     double precision = total_tp / (double)(total_tp + total_fp);
     double recall = total_tp / (double)(total_tp + total_fn);
     double f1 = 2 * precision * recall / (precision + recall);
-    cout << "STAGE 1 overall: precision=" << precision << " recall=" << recall << " F1=" << f1
+    cout << endl << "STAGE 1 overall: precision=" << precision << " recall=" << recall << " F1=" << f1
         << " mean error=" << (total_tp > 0 ? total_error / total_tp : 0.0) << " mm" << endl;
+    cout << "STAGE 2 accuracy (balls found correctly): nearest neighbour=" << confusionAccuracy(confusion_nn)
+        << ", with each ball used once=" << confusionAccuracy(confusion_unique) << endl;
+    cout << endl << "Confusion matrix (each ball used once):" << endl;
+    printConfusion(confusion_unique);
 
     delete[] pool_image;
 }
