@@ -1,1 +1,1 @@
-# OpenCVPoolBallRecognition
+# OpenCV PoolBall Recognition
