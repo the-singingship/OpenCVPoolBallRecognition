@@ -1,0 +1,12 @@
+Table size (mm): 1434 x 683
+Cloth hue range: 40 to 90 (0-180)
+Minimum saturation for cloth: 50
+Minimum brightness for cloth: 60
+Open/close element size: 7
+Minimum blob area: 800
+Area of one ball: 2500
+Pocket exclusion radius: 75
+Feature patch radius: 18
+Hue histogram bins: 12
+Matching distance (mm): 22 (strict test: 11)
+Splitting of touching balls: on
