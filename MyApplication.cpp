@@ -12,15 +12,19 @@
 #define MAKE_FOLDER(p) mkdir(p, 0777)
 #endif
 
-// Parameters are same for all images
-const int TABLE_W = 1434;    // table width in mm, columns of image
-const int TABLE_H = 683;     // table height in mm, rows of imageint HUE_LOW = 40, HUE_HIGH = 90;   // green cloth, in OpenCV hue units (0-180)
+// Parameters these are ordinary variables 
+const int TABLE_W = 1434;      // table width in mm, so the columns of the image
+const int TABLE_H = 683;       // table height in mm, so the rows of the image
 int HUE_LOW = 40, HUE_HIGH = 90;   // green cloth, in OpenCV hue units (0-180)
 int SAT_LOW = 50;                  // less saturated than this is not cloth
+int SAT_OFFSET = 30;               // cloth saturation limit = median cloth saturation of THIS image + this
+int EDGE_MARGIN = 50;              // the saturation test is only used this far inside the table (cushions are saturated too)
 int VAL_LOW = 60;                  // darker than this is not cloth (dark green balls, shadows)
 int KERNEL_SIZE = 7;               // size of the open/close element in pixels
 int MIN_BLOB_AREA = 800;           // smaller blobs are noise
-int BALL_AREA = 2500;              // typical area of one ball in the warped image
+int BALL_AREA = 2500;              // fallback only; the real ball area is measured from each image
+int MAX_BALLS_PER_BLOB = 16;       // there are only 16 balls, so a blob can never be more than that
+int ROUND_MIN_PERCENT = 85;        // area / area of smallest enclosing circle, in %. Single balls are round
 int POCKET_RADIUS = 75;            // ignore blobs this close to a pocket
 int PATCH_RADIUS = 18;             // pixels around each ball centre used for the features
 int HUE_BINS = 12;                 // hue histogram size
@@ -53,6 +57,25 @@ Mat findBallMask(const Mat& table, bool clean = true)
     Mat hsv, cloth, mask;
     cvtColor(table, hsv, COLOR_BGR2HSV);
     inRange(hsv, Scalar(HUE_LOW, SAT_LOW, VAL_LOW), Scalar(HUE_HIGH, 255, 255), cloth);
+    // Dark green balls (6, 14) have the same hue as the cloth but are more saturated.
+    // Inside the playing area, anything too saturated is NOT cloth. Near the cushions we skip this test.
+    Mat inner = Mat::zeros(cloth.size(), CV_8UC1);
+    inner(Rect(EDGE_MARGIN, EDGE_MARGIN, cloth.cols - 2 * EDGE_MARGIN, cloth.rows - 2 * EDGE_MARGIN)) = 255;
+    vector<Mat> ch;
+    split(hsv, ch);                                   // ch[1] = saturation
+    vector<uchar> sats;                               // saturation of the cloth pixels in the middle of the table
+    for (int r = 0; r < cloth.rows; r += 2)
+        for (int c = 0; c < cloth.cols; c += 2)
+            if (cloth.at<uchar>(r, c) && inner.at<uchar>(r, c)) sats.push_back(ch[1].at<uchar>(r, c));
+    if (!sats.empty())
+    {
+        nth_element(sats.begin(), sats.begin() + sats.size() / 2, sats.end());
+        int cap = sats[sats.size() / 2] + SAT_OFFSET;       // learned from this image, not a fixed number
+        Mat too_saturated;
+        inRange(hsv, Scalar(0, cap + 1, 0), Scalar(179, 255, 255), too_saturated);
+        bitwise_and(too_saturated, inner, too_saturated);
+        cloth = cloth - too_saturated;                      // those pixels are not cloth
+    }
     mask = 255 - cloth;
     if (clean)
     {
@@ -73,10 +96,33 @@ bool nearPocket(Point2f p)
 }
 
 // One centre (column, row) per ball. If split_touching is true, big blobs are split with k-means
+// How round is a blob? 1.0 = perfect circle. Two touching balls (peanut) score lower.
+double roundness(const vector<Point>& contour)
+{
+    Point2f c; float r;
+    minEnclosingCircle(contour, c, r);
+    return contourArea(contour) / (CV_PI * r * r);
+}
+
 vector<Point2f> detectBalls(const Mat& mask, bool split_touching)
 {
     vector<vector<Point>> contours;
     findContours(mask.clone(), contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
+
+    // Step 1: measure the one-ball area from this image = median area of the blobs that look like single balls
+    vector<double> single_areas;
+    for (size_t i = 0; i < contours.size(); i++)
+    {
+        double area = contourArea(contours[i]);
+        if (area > 0.6 * BALL_AREA && area < 1.4 * BALL_AREA && roundness(contours[i]) * 100 >= ROUND_MIN_PERCENT)
+            single_areas.push_back(area);
+    }
+    double ball_area = BALL_AREA;
+    if (single_areas.size() >= 3)
+    {
+        sort(single_areas.begin(), single_areas.end());
+        ball_area = single_areas[single_areas.size() / 2];
+    }
 
     vector<Point2f> centres;
     for (size_t i = 0; i < contours.size(); i++)
@@ -84,8 +130,16 @@ vector<Point2f> detectBalls(const Mat& mask, bool split_touching)
         double area = contourArea(contours[i]);
         if (area < MIN_BLOB_AREA) continue;
 
-        int count = split_touching ? (int)floor(area / BALL_AREA + 0.5) : 1;
+        // Step 2: round blobs that are not too big = one ball. Otherwise divide by the ball area, with a cap
+        int count = 1;
+        if (split_touching)
+        {
+            bool round_enough = roundness(contours[i]) * 100 >= ROUND_MIN_PERCENT;
+            if (!(round_enough && area < 1.7 * ball_area))
+                count = (int)floor(area / ball_area + 0.5);
+        }
         if (count < 1) count = 1;
+        if (count > MAX_BALLS_PER_BLOB) count = MAX_BALLS_PER_BLOB;
 
         if (count == 1)
         {
@@ -515,6 +569,9 @@ void saveParameters()
     file << "Table size (mm): " << TABLE_W << " x " << TABLE_H << "\n";
     file << "Cloth hue range: " << HUE_LOW << " to " << HUE_HIGH << " (0-180)\n";
     file << "Minimum saturation for cloth: " << SAT_LOW << "\n";
+    file << "Cloth saturation limit = median + " << SAT_OFFSET << "\n";
+    file << "Round blob threshold (%): " << ROUND_MIN_PERCENT << ", max balls per blob: " << MAX_BALLS_PER_BLOB << "\n";
+    file << "Edge margin for that test: " << EDGE_MARGIN << "\n";
     file << "Minimum brightness for cloth: " << VAL_LOW << "\n";
     file << "Open/close element size: " << KERNEL_SIZE << "\n";
     file << "Minimum blob area: " << MIN_BLOB_AREA << "\n";
@@ -586,6 +643,9 @@ void MyApplication()
     {
         runSweep("VAL_LOW", VAL_LOW, { 20, 40, 60, 80, 100, 120 }, pool_image, pool_files);
         runSweep("SAT_LOW", SAT_LOW, { 20, 35, 50, 65, 80, 100 }, pool_image, pool_files);
+        runSweep("ROUND_MIN_PERCENT", ROUND_MIN_PERCENT, { 60, 70, 80, 85, 90, 95 }, pool_image, pool_files);
+        runSweep("SAT_OFFSET", SAT_OFFSET, { 15, 20, 30, 40, 60, 255 }, pool_image, pool_files);
+        runSweep("EDGE_MARGIN", EDGE_MARGIN, { 0, 20, 35, 50, 65, 80 }, pool_image, pool_files);
         runSweep("HUE_LOW", HUE_LOW, { 20, 30, 40, 50, 60 }, pool_image, pool_files);
         runSweep("HUE_HIGH", HUE_HIGH, { 70, 80, 90, 100, 110 }, pool_image, pool_files);
         runSweep("KERNEL_SIZE", KERNEL_SIZE, { 3, 5, 7, 9, 11, 15 }, pool_image, pool_files);

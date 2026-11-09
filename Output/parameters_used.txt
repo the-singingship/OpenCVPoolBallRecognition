@@ -1,6 +1,9 @@
 Table size (mm): 1434 x 683
 Cloth hue range: 40 to 90 (0-180)
 Minimum saturation for cloth: 50
+Cloth saturation limit = median + 30
+Round blob threshold (%): 85, max balls per blob: 16
+Edge margin for that test: 50
 Minimum brightness for cloth: 60
 Open/close element size: 7
 Minimum blob area: 800
