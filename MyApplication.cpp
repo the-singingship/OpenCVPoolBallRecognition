@@ -1,10 +1,8 @@
-﻿
-
+﻿// Workflow
 //   Stage 1: find where every ball is on the table (position in mm on a top-down view)
 //   Stage 2: decide which ball each one is (1-15 or white)
 //   Then it measures how good both stages are and saves pictures and CSV files for the report.
 //
-// THE PIPELINE (in order)
 //   photo -> warp to top-down table (1 pixel = 1 mm)
 //         -> HSV colour mask: everything that is NOT green cloth is white
 //         -> clean the mask (morphology: open then close)
